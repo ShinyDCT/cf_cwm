@@ -1,11 +1,28 @@
 # ============================================================
-# 上游同步工作流 — Sync Upstream
-# 作用：每天北京时间早上 8 点自动拉取上游仓库最新代码，
-#       同步到本仓库 main 分支，推送后由 Cloudflare Pages
-#       的 Git 集成自动触发构建部署。
+# 上游同步 + 混淆工作流 — Sync Upstream + Obfuscate
+#
+# 作用：每天北京时间早上 8 点自动拉取上游 KJGX66F/usque-custom-pro
+#       最新代码合并到 main，随后：
+#         1) 若上游更新了 pages/ 明文源码
+#            -> javascript-obfuscator 深度混淆（scanda-obf 参数集）
+#            -> 产物写入 pages_cfb/（index.html/style.css 压缩，
+#               _headers/_routes.json/README.md/warp-egress-selector.py 原样复制）
+#            -> 连同 pages/ 更新一起提交并推送
+#            -> Cloudflare Pages（根目录 pages_cfb）自动重新部署混淆版
+#         2) 若上游未更新 / 未动 pages/
+#            -> 仅推送合并结果（如有），不重新混淆、不产生冗余提交
+#
+# 内置混淆门禁（任一失败则整个工作流失败，不产生提交）：
+#   - esbuild bundle 语义校验三个 JS（与 wrangler 构建同款，可抓 const 重赋值）
+#   - _worker.js 保留 "export default"（Worker 模块入口）
+#   - node 沙箱执行混淆后的 usque-register.js，断言 window.UsqueRegister 4 方法
+#   - 压缩后的 index.html 保留关键 DOM id 与资源引用
+#   - 压缩后的 style.css 保留关键选择器
+#
+# 提交消息刻意使用干净文案（不含任何 ci 跳过标记），
+# 确保 Cloudflare Pages 识别为正常更新并自动重新部署。
 # ============================================================
-
-name: Sync Upstream
+name: Sync Upstream + Obfuscate
 
 on:
   schedule:
@@ -30,6 +47,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout（完整历史）
@@ -46,9 +64,8 @@ jobs:
 
       - name: 添加上游远程
         env:
-          # ★ 需按实际情况修改：上游仓库地址
-          # 也可以在仓库 Settings → Secrets and variables → Actions → Variables
-          # 中新建变量 UPSTREAM_URL 覆盖此默认值
+          # ★ 上游仓库地址，可在 Settings → Secrets and variables → Actions
+          #   → Variables 中新建变量 UPSTREAM_URL 覆盖此默认值
           UPSTREAM_URL: ${{ vars.UPSTREAM_URL || 'https://github.com/KJGX66F/usque-custom-pro.git' }}
         run: |
           git remote add upstream "$UPSTREAM_URL"
@@ -61,13 +78,14 @@ jobs:
           echo "上游默认分支: $BRANCH"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
-      - name: 同步 main 分支
+      - name: 同步 main（merge/reset 策略）
         env:
-          # ★ 冲突处理策略（需确认）：
+          # ★ 冲突处理策略（可配置）：
           #   "merge"  = 默认。合并冲突时以上游为准自动解决（git merge -X theirs）；
           #              仍无法解决时中止任务并告警，不推送。
           #   "reset"  = 强制对齐上游（git reset --hard + force push）。
-          #              会丢弃本仓库所有独立提交，仅在确定本地不做任何改动时使用。
+          #              会丢弃本仓库所有独立提交（含 pages_cfb 混淆产物），
+          #              仅在确定本地不做任何改动时使用；此策略下不执行混淆。
           CONFLICT_STRATEGY: ${{ vars.CONFLICT_STRATEGY || 'merge' }}
         run: |
           UP_BRANCH="${{ steps.upstream.outputs.branch }}"
@@ -78,6 +96,9 @@ jobs:
             echo "上游无新提交，跳过同步。"
             exit 0
           fi
+
+          BEFORE=$(git rev-parse HEAD)
+          echo "BEFORE=$BEFORE" >> "$GITHUB_ENV"
 
           if [ "$CONFLICT_STRATEGY" = "reset" ]; then
             echo "使用强制对齐策略：本地 main 将被重置为上游状态。"
@@ -93,5 +114,165 @@ jobs:
             exit 1
           fi
 
+          echo "同步完成：main 已合并上游 $UP_BRANCH 最新提交。"
+          echo "AFTER=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: 检测 pages/ 是否有变化
+        id: pages_check
+        run: |
+          if git diff --quiet "$BEFORE" "$AFTER" -- pages/; then
+            echo "上游本次未改动 pages/，跳过混淆。"
+            echo "pages_changed=false" >> "$GITHUB_ENV"
+          else
+            echo "上游已更新 pages/，开始混淆。"
+            echo "pages_changed=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: 安装混淆工具链
+        if: env.pages_changed == 'true'
+        run: |
+          npm install javascript-obfuscator esbuild html-minifier-terser clean-css --no-fund --no-audit
+
+      - name: 混淆 pages/ -> pages_cfb/（内置门禁，失败即中止）
+        if: env.pages_changed == 'true'
+        run: |
+          cat > obfuscate.js <<'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const cp = require('child_process');
+
+          const SRC = 'pages';        // 明文源（只读）
+          const DST = 'pages_cfb';    // 混淆产物目录（部署用）
+          const KEEP = ['_headers', '_routes.json', 'README.md', 'warp-egress-selector.py'];
+          const log = (m) => { console.log(m); try { fs.appendFileSync('obfuscate.log', m + '\n'); } catch {} };
+
+          const OBF_OPTS = {
+            compact: true,
+            controlFlowFlattening: true,
+            controlFlowFlatteningThreshold: 0.75,
+            deadCodeInjection: true,
+            deadCodeInjectionThreshold: 0.4,
+            identifierNamesGenerator: 'hexadecimal',
+            renameGlobals: false,
+            stringArray: true,
+            stringArrayEncoding: ['rc4'],
+            stringArrayThreshold: 0.75,
+            transformObjectKeys: true,
+            unicodeEscapeSequence: true,
+            splitStrings: true,
+            splitStringsChunkLength: 5
+          };
+
+          let failed = false;
+
+          function esbuildCheck(file, extraArgs, label) {
+            const esbuild = require('esbuild');
+            const format = extraArgs.includes('--format=esm') ? 'esm' : 'iife';
+            const external = format === 'esm' ? ['cloudflare:sockets'] : undefined;
+            try {
+              esbuild.buildSync({ entryPoints: [file], bundle: true, format, external, write: false, logLevel: 'error' });
+              log('[esbuild] ' + label + ': OK');
+            } catch (e) {
+              const m = String(e.message || '').match(/Cannot assign to "(\w+)"/);
+              log('[esbuild] ' + label + ': FAIL ' + (m ? 'const-assign:' + m[1] : String(e.message).split('\n').slice(0, 2).join(' | ')));
+              failed = true;
+            }
+          }
+
+          // 0) 准备 pages_cfb/
+          fs.mkdirSync(DST, { recursive: true });
+          for (const k of KEEP) {
+            if (fs.existsSync(path.join(SRC, k))) {
+              fs.copyFileSync(path.join(SRC, k), path.join(DST, k));
+              log('[keep] ' + k + ' copied as-is');
+            }
+          }
+
+          // 1) 三个 JS 深度混淆
+          function obfuscateJs(name) {
+            const src = fs.readFileSync(path.join(SRC, name), 'utf8');
+            const code = require('javascript-obfuscator').obfuscate(src, OBF_OPTS).getObfuscatedCode();
+            fs.writeFileSync(path.join(DST, name), code);
+            log('[obf] ' + name + ': ' + src.length + 'B -> ' + Buffer.byteLength(code) + 'B');
+            return code;
+          }
+          const workerCode = obfuscateJs('_worker.js');
+          obfuscateJs('app.js');
+          obfuscateJs('usque-register.js');
+
+          // 2) esbuild 语义校验
+          esbuildCheck(path.join(DST, '_worker.js'), '--format=esm --external:cloudflare:sockets', '_worker.js(esm)');
+          esbuildCheck(path.join(DST, 'app.js'), '--format=iife', 'app.js(iife)');
+          esbuildCheck(path.join(DST, 'usque-register.js'), '--format=iife', 'usque-register.js(iife)');
+
+          // 3) export default 必须保留
+          log('[check] _worker.js export default: ' + (workerCode.includes('export default') ? 'YES' : 'NO!!'));
+          if (!workerCode.includes('export default')) failed = true;
+
+          // 4) usque-register.js 沙箱断言
+          try {
+            const p = path.join(DST, 'usque-register.js');
+            const req = (path.isAbsolute(p) ? '' : './') + p.split(path.sep).join('/');
+            const script = `
+              globalThis.window = {};
+              require(${JSON.stringify(req)});
+              const U = globalThis.window.UsqueRegister;
+              const names = ['registerDevice','generateMasqueKeyMaterial','cfTimestamp','buildSec1P256'];
+              const miss = names.filter(n => typeof U?.[n] !== 'function');
+              console.log('RESULT:' + (miss.length ? 'MISSING ' + miss.join(',') : 'ALL4_OK'));
+            `;
+            const r = cp.spawnSync('node', ['-e', script], { encoding: 'utf8' });
+            const outLine = (r.stdout || '').split('\n').find(l => l.startsWith('RESULT:'));
+            const ok = outLine === 'RESULT:ALL4_OK';
+            log('[sandbox] usque-register.js: ' + (ok ? 'ALL4_OK' : 'FAIL ' + (outLine || r.status)));
+            if (!ok) failed = true;
+          } catch (e) {
+            log('[sandbox] usque-register.js RUN FAIL: ' + String(e.message).split('\n')[0]);
+            failed = true;
+          }
+
+          // 5) HTML 压缩
+          (async () => {
+            const { minify } = require('html-minifier-terser');
+            const html = fs.readFileSync(path.join(SRC, 'index.html'), 'utf8');
+            const out = await minify(html, { collapseWhitespace: true, removeComments: true, minifyCSS: false, minifyJS: false, keepClosingSlash: true });
+            fs.writeFileSync(path.join(DST, 'index.html'), out);
+            const ids = ['id="regStart"', 'usque-register.js', 'app.js', 'style.css', 'mainOutput', 'toastStack'];
+            const miss = ids.filter(s => !out.includes(s));
+            log('[html] index.html: ' + html.length + 'B -> ' + Buffer.byteLength(out) + 'B | key ids: ' + (miss.length ? 'MISSING ' + miss.join(',') : 'ALL OK'));
+            if (miss.length) failed = true;
+          })();
+
+          // 6) CSS 压缩
+          const CleanCSS = require('clean-css');
+          const css = fs.readFileSync(path.join(SRC, 'style.css'), 'utf8');
+          const res = new CleanCSS({ level: 2 }).minify(css);
+          if (res.errors.length) { log('[css] errors: ' + res.errors.join(';')); failed = true; }
+          fs.writeFileSync(path.join(DST, 'style.css'), res.styles);
+          const sels = ['.toast-stack', '.toast', 'body', '.wrap'];
+          const missSel = sels.filter(s => !res.styles.includes(s));
+          log('[css] style.css: ' + css.length + 'B -> ' + res.styles.length + 'B | selectors: ' + (missSel.length ? 'MISSING ' + missSel.join(',') : 'ALL OK'));
+          if (missSel.length) failed = true;
+
+          // 7) 收尾
+          setTimeout(() => {
+            log('[result] BUILD: ' + (failed ? 'FAILED' : 'PASS') + ' (pages_cfb ready)');
+            console.log('[result] ' + (failed ? 'FAILED' : 'PASS'));
+            process.exit(failed ? 1 : 0);
+          }, 300);
+          EOF
+          node obfuscate.js
+
+      - name: 提交混淆产物并推送
+        if: env.pages_changed == 'true'
+        run: |
+          git add pages_cfb pages
+          git commit -m "chore: sync upstream and obfuscate pages_cfb"
           git push origin main
-          echo "同步完成：main 已更新至上游 $UP_BRANCH 最新提交。"
+          echo "已推送：上游同步 + pages_cfb 混淆产物（Cloudflare Pages 将自动重新部署）"
+
+      - name: 推送上游同步结果
+        if: env.pages_changed != 'true'
+        run: |
+          git push origin main
+          echo "已推送上游同步结果（pages/ 无变化，未重新混淆）"
