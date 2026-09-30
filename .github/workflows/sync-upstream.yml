@@ -1,0 +1,97 @@
+# ============================================================
+# 上游同步工作流 — Sync Upstream
+# 作用：每天北京时间早上 8 点自动拉取上游仓库最新代码，
+#       同步到本仓库 main 分支，推送后由 Cloudflare Pages
+#       的 Git 集成自动触发构建部署。
+# ============================================================
+
+name: Sync Upstream
+
+on:
+  schedule:
+    # ★ 注意：GitHub Actions 的 cron 使用 UTC 时区，不认北京时间。
+    #   换算公式：北京时间 = UTC + 8
+    #   北京时间早上 08:00 = UTC 00:00 → 表达式为 "0 0 * * *"
+    #   （字段顺序：分 时 日 月 周）
+    - cron: '0 0 * * *'
+
+  # 支持在 Actions 页面手动触发，随时补同步
+  workflow_dispatch:
+
+# 使用仓库自带的 GITHUB_TOKEN 推送，需要 contents 写权限
+permissions:
+  contents: write
+
+# 防止手动触发与定时触发并发执行产生竞争
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout（完整历史）
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0 # 拉取完整提交历史，否则 merge 上游会失败
+          token: ${{ secrets.GITHUB_TOKEN }} # 显式声明，推送凭据由 checkout 自动持久化
+
+      - name: 配置 Git 提交身份
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 添加上游远程
+        env:
+          # ★ 需按实际情况修改：上游仓库地址
+          # 也可以在仓库 Settings → Secrets and variables → Actions → Variables
+          # 中新建变量 UPSTREAM_URL 覆盖此默认值
+          UPSTREAM_URL: ${{ vars.UPSTREAM_URL || 'https://github.com/KJGX66F/usque-custom-pro.git' }}
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream --prune --tags
+
+      - name: 探测上游默认分支
+        id: upstream
+        run: |
+          BRANCH=$(git remote show upstream | sed -n 's/.*HEAD branch: //p')
+          echo "上游默认分支: $BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: 同步 main 分支
+        env:
+          # ★ 冲突处理策略（需确认）：
+          #   "merge"  = 默认。合并冲突时以上游为准自动解决（git merge -X theirs）；
+          #              仍无法解决时中止任务并告警，不推送。
+          #   "reset"  = 强制对齐上游（git reset --hard + force push）。
+          #              会丢弃本仓库所有独立提交，仅在确定本地不做任何改动时使用。
+          CONFLICT_STRATEGY: ${{ vars.CONFLICT_STRATEGY || 'merge' }}
+        run: |
+          UP_BRANCH="${{ steps.upstream.outputs.branch }}"
+          git checkout main
+
+          # 跳过无更新的情况
+          if git merge-base --is-ancestor "upstream/$UP_BRANCH" HEAD; then
+            echo "上游无新提交，跳过同步。"
+            exit 0
+          fi
+
+          if [ "$CONFLICT_STRATEGY" = "reset" ]; then
+            echo "使用强制对齐策略：本地 main 将被重置为上游状态。"
+            git reset --hard "upstream/$UP_BRANCH"
+            git push --force-with-lease origin main
+            exit 0
+          fi
+
+          # 默认策略：合并，内容冲突时以上游版本为准
+          if ! git merge "upstream/$UP_BRANCH" --no-edit -X theirs; then
+            echo "::error::合并冲突无法自动解决（可能是本地改写了上游历史或存在结构性冲突）。已中止同步并回滚，请手动处理。"
+            git merge --abort || true
+            exit 1
+          fi
+
+          git push origin main
+          echo "同步完成：main 已更新至上游 $UP_BRANCH 最新提交。"
